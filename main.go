@@ -39,9 +39,9 @@ func run(logger *slog.Logger) error {
 	}
 	addr := flag.String("addr", addrDefault, "listen address (env "+addrEnv+")")
 	maxBodyBytes := flag.Int64("max-body-bytes", server.DefaultMaxBodyBytes, "maximum scan request body size in bytes")
-	maxLineBytes := flag.Int("max-line-bytes", server.DefaultMaxLineBytes, "maximum length of a single line of scanned content in bytes")
 	maxConcurrentScans := flag.Int("max-concurrent-scans", server.DefaultMaxConcurrentScans, "maximum number of scans running at once")
-	scanTimeout := flag.Duration("scan-timeout", server.DefaultScanTimeout, "time limit for a single scan")
+	maxQueuedScans := flag.Int("max-queued-scans", server.DefaultMaxQueuedScans, "maximum number of requests waiting for a scan slot (negative disables queueing)")
+	scanTimeout := flag.Duration("scan-timeout", server.DefaultScanTimeout, "time limit for a single scan, including time spent waiting for a slot")
 	allowedHostsFlag := flag.String("allowed-hosts", "", "comma-separated extra host names or IPs accepted in the Host and Origin headers (localhost and loopback IPs are always accepted)")
 	flag.Parse()
 
@@ -76,8 +76,8 @@ func run(logger *slog.Logger) error {
 		Addr: *addr,
 		Handler: server.New(scanner, server.Options{
 			MaxBodyBytes:       *maxBodyBytes,
-			MaxLineBytes:       *maxLineBytes,
 			MaxConcurrentScans: *maxConcurrentScans,
+			MaxQueuedScans:     *maxQueuedScans,
 			ScanTimeout:        *scanTimeout,
 			AllowedHosts:       allowedHosts,
 			Logger:             logger,

@@ -18,13 +18,11 @@ import (
 	"github.com/betterleaks/betterleaks/report"
 )
 
-// Default limits for POST /v1/scan. Scan cost grows with the square of the
-// number of findings and with findings-per-line times line length, and the
-// library cannot be interrupted mid-rule, so the input itself has to be bounded.
+// Default limits for POST /v1/scan.
 const (
-	DefaultMaxBodyBytes       int64 = 256 << 10
-	DefaultMaxLineBytes             = 4 << 10
+	DefaultMaxBodyBytes       int64 = 1 << 20
 	DefaultMaxConcurrentScans       = 2
+	DefaultMaxQueuedScans           = 32
 	DefaultScanTimeout              = 30 * time.Second
 )
 
@@ -54,6 +52,7 @@ type Finding struct {
 	Secret      string   `json:"secret"`
 	File        string   `json:"file"`
 	Entropy     float32  `json:"entropy"`
+	Confidence  string   `json:"confidence"`
 	Tags        []string `json:"tags"`
 	Fingerprint string   `json:"fingerprint"`
 }
@@ -61,12 +60,18 @@ type Finding struct {
 type scanRequest struct {
 	Content string `json:"content"`
 	Path    string `json:"path"`
-	Redact  bool   `json:"redact"`
+	// Redact masks secrets in the findings. Nil means true.
+	Redact *bool `json:"redact"`
 }
 
 type scanResponse struct {
-	Findings []Finding `json:"findings"`
-	Count    int       `json:"count"`
+	// Detected reports whether any secret was found.
+	Detected bool `json:"detected"`
+	// RedactedContent is the content with every detected secret replaced by
+	// a "[REDACTED:<rule id>]" placeholder.
+	RedactedContent string    `json:"redacted_content"`
+	Findings        []Finding `json:"findings"`
+	Count           int       `json:"count"`
 }
 
 type rulesResponse struct {
@@ -83,14 +88,15 @@ type Options struct {
 	// MaxBodyBytes limits the scan request body. Zero or negative means
 	// DefaultMaxBodyBytes.
 	MaxBodyBytes int64
-	// MaxLineBytes limits the length of a single line of content. Zero or
-	// negative means DefaultMaxLineBytes.
-	MaxLineBytes int
-	// MaxConcurrentScans limits scans running at once; further requests are
-	// rejected with 503. Zero or negative means DefaultMaxConcurrentScans.
+	// MaxConcurrentScans limits scans running at once; further requests
+	// wait. Zero or negative means DefaultMaxConcurrentScans.
 	MaxConcurrentScans int
-	// ScanTimeout bounds a single scan. Zero or negative means
-	// DefaultScanTimeout.
+	// MaxQueuedScans limits requests waiting for a scan slot; further
+	// requests are rejected with 503. Zero means DefaultMaxQueuedScans and a
+	// negative value disables queueing.
+	MaxQueuedScans int
+	// ScanTimeout bounds a single scan, including the time it waits for a
+	// slot. Zero or negative means DefaultScanTimeout.
 	ScanTimeout time.Duration
 	// AllowedHosts lists host names or IPs accepted in the Host and Origin
 	// headers in addition to localhost and loopback IPs.
@@ -102,8 +108,10 @@ type Options struct {
 type handler struct {
 	scanner      Scanner
 	maxBodyBytes int64
-	maxLineBytes int
 	scanTimeout  time.Duration
+	// admitted holds every request that is scanning or waiting to scan;
+	// scanSlots holds those actually scanning.
+	admitted     chan struct{}
 	scanSlots    chan struct{}
 	allowedHosts map[string]struct{}
 	logger       *slog.Logger
@@ -111,19 +119,19 @@ type handler struct {
 
 // New returns the API handler.
 func New(scanner Scanner, opts Options) http.Handler {
+	return newHandler(scanner, opts).routes()
+}
+
+func newHandler(scanner Scanner, opts Options) *handler {
 	h := &handler{
 		scanner:      scanner,
 		maxBodyBytes: opts.MaxBodyBytes,
-		maxLineBytes: opts.MaxLineBytes,
 		scanTimeout:  opts.ScanTimeout,
 		allowedHosts: make(map[string]struct{}, len(opts.AllowedHosts)),
 		logger:       opts.Logger,
 	}
 	if h.maxBodyBytes <= 0 {
 		h.maxBodyBytes = DefaultMaxBodyBytes
-	}
-	if h.maxLineBytes <= 0 {
-		h.maxLineBytes = DefaultMaxLineBytes
 	}
 	if h.scanTimeout <= 0 {
 		h.scanTimeout = DefaultScanTimeout
@@ -132,7 +140,12 @@ func New(scanner Scanner, opts Options) http.Handler {
 	if slots <= 0 {
 		slots = DefaultMaxConcurrentScans
 	}
+	queued := opts.MaxQueuedScans
+	if queued == 0 {
+		queued = DefaultMaxQueuedScans
+	}
 	h.scanSlots = make(chan struct{}, slots)
+	h.admitted = make(chan struct{}, slots+max(queued, 0))
 	for _, host := range opts.AllowedHosts {
 		if host = normalizeHost(host); host != "" {
 			h.allowedHosts[host] = struct{}{}
@@ -141,7 +154,10 @@ func New(scanner Scanner, opts Options) http.Handler {
 	if h.logger == nil {
 		h.logger = slog.Default()
 	}
+	return h
+}
 
+func (h *handler) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /v1/rules", h.rules)
@@ -238,10 +254,6 @@ func (h *handler) scan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if longestLine(req.Content) > h.maxLineBytes {
-		writeError(w, http.StatusRequestEntityTooLarge, "content has a line longer than the configured limit")
-		return
-	}
 	// betterleaks skips fragments whose path equals its config path, and the
 	// default config has an empty path, which cleans to ".". Such a path would
 	// silently disable detection.
@@ -250,12 +262,11 @@ func (h *handler) scan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Take a slot only once the request is fully read and validated: a client
-	// that sends its body slowly must not be able to hold a slot. The body is
-	// small (MaxBodyBytes), so buffering it for rejected requests is cheap.
+	// Join the queue only once the request is fully read and validated: a
+	// client that sends its body slowly must not be able to hold a place.
 	select {
-	case h.scanSlots <- struct{}{}:
-		defer func() { <-h.scanSlots }()
+	case h.admitted <- struct{}{}:
+		defer func() { <-h.admitted }()
 	default:
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, "too many concurrent scans")
@@ -265,7 +276,7 @@ func (h *handler) scan(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), h.scanTimeout)
 	defer cancel()
 
-	found, err := h.scanner.Scan(ctx, req.Content, req.Path)
+	found, err := h.scanQueued(ctx, req.Content, req.Path)
 	if err != nil {
 		if r.Context().Err() != nil {
 			writeError(w, http.StatusServiceUnavailable, "scan canceled")
@@ -282,17 +293,38 @@ func (h *handler) scan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	findings := make([]Finding, 0, len(found))
-	for _, f := range found {
-		findings = append(findings, toFinding(f, req.Redact))
+	redact := req.Redact == nil || *req.Redact
+	lit := newLiterals(found.secrets)
+	findings := make([]Finding, 0, len(found.detections))
+	for _, d := range found.detections {
+		findings = append(findings, toFinding(d.finding, redact, lit))
 	}
-	writeJSON(w, http.StatusOK, scanResponse{Findings: findings, Count: len(findings)})
+	writeJSON(w, http.StatusOK, scanResponse{
+		Detected:        len(findings) > 0,
+		RedactedContent: redactContent(req.Content, found, lit),
+		Findings:        findings,
+		Count:           len(findings),
+	})
 }
 
-func toFinding(f report.Finding, redact bool) Finding {
+// scanQueued waits for a scan slot and then scans content.
+func (h *handler) scanQueued(ctx context.Context, content, path string) (scanResult, error) {
+	select {
+	case h.scanSlots <- struct{}{}:
+		defer func() { <-h.scanSlots }()
+	case <-ctx.Done():
+		return scanResult{}, ctx.Err()
+	}
+	return scanContent(ctx, h.scanner, content, path)
+}
+
+func toFinding(f report.Finding, redact bool, lit *literals) Finding {
+	confidence := f.Attributes[confidenceAttr]
 	if redact {
-		// The caller-supplied path is echoed in file and fingerprint; mask the
-		// secret there too in case the path itself contains it.
+		// The caller-supplied path is echoed in file and fingerprint; mask
+		// every detected secret there in case the path itself contains one.
+		f.File = lit.redact(f.File)
+		f.Fingerprint = lit.redact(f.Fingerprint)
 		if f.Secret != "" {
 			f.File = strings.ReplaceAll(f.File, f.Secret, redacted)
 			f.Fingerprint = strings.ReplaceAll(f.Fingerprint, f.Secret, redacted)
@@ -317,25 +349,10 @@ func toFinding(f report.Finding, redact bool) Finding {
 		Secret:      f.Secret,
 		File:        f.File,
 		Entropy:     f.Entropy,
+		Confidence:  confidence,
 		Tags:        tags,
 		Fingerprint: f.Fingerprint,
 	}
-}
-
-// longestLine returns the byte length of the longest line in s.
-func longestLine(s string) int {
-	longest := 0
-	for len(s) > 0 {
-		i := strings.IndexByte(s, '\n')
-		if i < 0 {
-			i = len(s)
-			s = ""
-		} else {
-			s = s[i+1:]
-		}
-		longest = max(longest, i)
-	}
-	return longest
 }
 
 func writeDecodeError(w http.ResponseWriter, err error) {

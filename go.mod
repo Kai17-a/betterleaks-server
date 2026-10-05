@@ -2,7 +2,10 @@ module betterleaks-server
 
 go 1.26.8
 
-require github.com/betterleaks/betterleaks v1.9.0
+require (
+	github.com/betterleaks/betterleaks v1.9.0
+	github.com/rrethy/ahocorasick v1.0.0
+)
 
 require (
 	dario.cat/mergo v1.0.2 // indirect
@@ -38,7 +41,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.3.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
 	github.com/pkoukk/tiktoken-go v0.1.8 // indirect
-	github.com/rrethy/ahocorasick v1.0.0 // indirect
 	github.com/rs/zerolog v1.33.0 // indirect
 	github.com/shurcooL/githubv4 v0.0.0-20260209031235-2402fdf4a9ed // indirect
 	github.com/shurcooL/graphql v0.0.0-20240915155400-7ee5256398cf // indirect

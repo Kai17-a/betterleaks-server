@@ -48,7 +48,7 @@ type fakeScanner struct {
 	scan func(ctx context.Context) ([]report.Finding, error)
 }
 
-func (f fakeScanner) Scan(ctx context.Context, _, _ string) ([]report.Finding, error) {
+func (f fakeScanner) ScanFragment(ctx context.Context, _, _ string, _ bool) ([]report.Finding, error) {
 	if f.scan != nil {
 		return f.scan(ctx)
 	}
@@ -56,6 +56,8 @@ func (f fakeScanner) Scan(ctx context.Context, _, _ string) ([]report.Finding, e
 }
 
 func (f fakeScanner) Rules() []Rule { return nil }
+
+func ptr[T any](v T) *T { return &v }
 
 func scanBody(t *testing.T, req scanRequest) string {
 	t.Helper()
@@ -123,7 +125,7 @@ func TestRulesNilIsEmptyArray(t *testing.T) {
 }
 
 func TestScanFindsSecret(t *testing.T) {
-	body := scanBody(t, scanRequest{Content: "line one\ntoken = \"" + testSecret + "\"\n", Path: "conf/app.env"})
+	body := scanBody(t, scanRequest{Content: "line one\ntoken = \"" + testSecret + "\"\n", Path: "conf/app.env", Redact: ptr(false)})
 	rec := do(newRealHandler(t, Options{}), http.MethodPost, "/v1/scan", "application/json", body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
@@ -148,13 +150,16 @@ func TestScanFindsSecret(t *testing.T) {
 	if f.Fingerprint != "conf/app.env:github-pat:2" {
 		t.Errorf("fingerprint = %q", f.Fingerprint)
 	}
-	if strings.Contains(rec.Body.String(), "line one") {
-		t.Error("response must not echo unrelated input content")
+	if f.Confidence != "high" {
+		t.Errorf("confidence = %q, want high", f.Confidence)
+	}
+	if !resp.Detected {
+		t.Error("detected = false, want true")
 	}
 }
 
 func TestScanRedact(t *testing.T) {
-	body := scanBody(t, scanRequest{Content: "token = \"" + testSecret + "\"", Redact: true})
+	body := scanBody(t, scanRequest{Content: "token = \"" + testSecret + "\"", Redact: ptr(true)})
 	rec := do(newRealHandler(t, Options{}), http.MethodPost, "/v1/scan", "application/json; charset=utf-8", body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
@@ -176,7 +181,7 @@ func TestScanRedact(t *testing.T) {
 func TestScanRedactMasksWholeMatch(t *testing.T) {
 	other := "OTHER" + "SECRETVALUE123"
 	uri := "https://deploy:" + "Xk9vQ2mLp7Rt4Zs8" + "@git.acme-corp.io/repo?token=" + other
-	body := scanBody(t, scanRequest{Content: "DATABASE_URL=" + uri, Redact: true})
+	body := scanBody(t, scanRequest{Content: "DATABASE_URL=" + uri, Redact: ptr(true)})
 	rec := do(newRealHandler(t, Options{}), http.MethodPost, "/v1/scan", "application/json", body)
 	resp := decode[scanResponse](t, rec)
 	if resp.Count == 0 {
@@ -192,34 +197,13 @@ func TestScanRedactMasksWholeMatch(t *testing.T) {
 	}
 }
 
-func TestScanLineLimitBoundary(t *testing.T) {
-	h := newRealHandler(t, Options{MaxLineBytes: 16})
-	tests := []struct {
-		name    string
-		content string
-		want    int
-	}{
-		{"at limit", "short\n" + strings.Repeat("a", 16) + "\nend", http.StatusOK},
-		{"over limit", "short\n" + strings.Repeat("a", 17) + "\nend", http.StatusRequestEntityTooLarge},
-		{"crlf counts the cr", strings.Repeat("a", 16) + "\r\n", http.StatusRequestEntityTooLarge},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			rec := do(h, http.MethodPost, "/v1/scan", "application/json", scanBody(t, scanRequest{Content: tt.content}))
-			if rec.Code != tt.want {
-				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.want, rec.Body.String())
-			}
-		})
-	}
-}
-
 // The caller-supplied path is echoed in file and fingerprint, so a secret in
 // the path must be masked there as well.
 func TestScanRedactMasksSecretInPath(t *testing.T) {
 	body := scanBody(t, scanRequest{
 		Content: "token = \"" + testSecret + "\"",
 		Path:    "credentials/" + testSecret + ".env",
-		Redact:  true,
+		Redact:  ptr(true),
 	})
 	rec := do(newRealHandler(t, Options{}), http.MethodPost, "/v1/scan", "application/json", body)
 	if resp := decode[scanResponse](t, rec); resp.Count == 0 {
@@ -290,7 +274,7 @@ func TestScanConcurrencyLimit(t *testing.T) {
 		<-release
 		return nil, nil
 	}}
-	h := New(scanner, Options{MaxConcurrentScans: 1, Logger: discardLogger()})
+	h := New(scanner, Options{MaxConcurrentScans: 1, MaxQueuedScans: -1, Logger: discardLogger()})
 
 	done := make(chan int)
 	go func() {
@@ -323,6 +307,68 @@ func TestScanConcurrencyLimit(t *testing.T) {
 	}
 }
 
+// Requests beyond the running scans wait for a slot instead of failing, up to
+// the queue limit.
+func TestScanQueue(t *testing.T) {
+	started := make(chan struct{}, 8)
+	release := make(chan struct{})
+	scanner := fakeScanner{scan: func(context.Context) ([]report.Finding, error) {
+		started <- struct{}{}
+		<-release
+		return nil, nil
+	}}
+	inner := newHandler(scanner, Options{MaxConcurrentScans: 1, MaxQueuedScans: 1, Logger: discardLogger()})
+	hh := inner.routes()
+
+	codes := make(chan int, 2)
+	post := func() { codes <- do(hh, http.MethodPost, "/v1/scan", "application/json", `{"content":"x"}`).Code }
+	go post()
+	<-started // first request is scanning
+	go post() // second request queues
+
+	// Wait until the second request holds its place in the queue.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(inner.admitted) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("second request never queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if code := do(hh, http.MethodPost, "/v1/scan", "application/json", `{"content":"x"}`).Code; code != http.StatusServiceUnavailable {
+		t.Errorf("status with full queue = %d, want 503", code)
+	}
+
+	close(release)
+	for range 2 {
+		if code := <-codes; code != http.StatusOK {
+			t.Errorf("queued request status = %d, want 200", code)
+		}
+	}
+}
+
+func TestScanTimeoutWhileQueued(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	scanner := fakeScanner{scan: func(context.Context) ([]report.Finding, error) {
+		started <- struct{}{}
+		<-release
+		return nil, nil
+	}}
+	h := New(scanner, Options{MaxConcurrentScans: 1, ScanTimeout: 50 * time.Millisecond, Logger: discardLogger()})
+	go do(h, http.MethodPost, "/v1/scan", "application/json", `{"content":"x"}`)
+	<-started
+
+	rec := do(h, http.MethodPost, "/v1/scan", "application/json", `{"content":"x"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if msg := decode[errorResponse](t, rec).Error; msg != "scan timed out" {
+		t.Fatalf("error = %q, want scan timed out", msg)
+	}
+}
+
 func TestScanTimeout(t *testing.T) {
 	scanner := fakeScanner{scan: func(ctx context.Context) ([]report.Finding, error) {
 		<-ctx.Done()
@@ -338,22 +384,13 @@ func TestScanTimeout(t *testing.T) {
 	}
 }
 
-func TestLongestLine(t *testing.T) {
-	tests := map[string]int{"": 0, "abc": 3, "abc\n": 3, "a\nbcd\ne": 3, "\n\n": 0, "ab\ncdef": 4}
-	for in, want := range tests {
-		if got := longestLine(in); got != want {
-			t.Errorf("longestLine(%q) = %d, want %d", in, got, want)
-		}
-	}
-}
-
 func TestScanNoFindingsIsEmptyArray(t *testing.T) {
 	body := scanBody(t, scanRequest{Content: "nothing to see here"})
 	rec := do(newRealHandler(t, Options{}), http.MethodPost, "/v1/scan", "application/json", body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if got := strings.TrimSpace(rec.Body.String()); got != `{"findings":[],"count":0}` {
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"detected":false,"redacted_content":"nothing to see here","findings":[],"count":0}` {
 		t.Fatalf("body = %s", got)
 	}
 }
@@ -379,7 +416,6 @@ func TestScanErrors(t *testing.T) {
 		{"missing content", http.MethodPost, "/v1/scan", jsonType, `{"path":"a.txt"}`, 0, http.StatusBadRequest, true},
 		{"empty content", http.MethodPost, "/v1/scan", jsonType, `{"content":""}`, 0, http.StatusBadRequest, true},
 		{"empty body", http.MethodPost, "/v1/scan", jsonType, ``, 0, http.StatusBadRequest, true},
-		{"line too long", http.MethodPost, "/v1/scan", jsonType, `{"content":"ok\n` + strings.Repeat("a", 129) + `"}`, 0, http.StatusRequestEntityTooLarge, true},
 		{"body too large", http.MethodPost, "/v1/scan", jsonType, `{"content":"` + strings.Repeat("a", 64) + `"}`, 32, http.StatusRequestEntityTooLarge, true},
 		{"get on scan", http.MethodGet, "/v1/scan", "", "", 0, http.StatusMethodNotAllowed, false},
 		{"post on rules", http.MethodPost, "/v1/rules", jsonType, `{}`, 0, http.StatusMethodNotAllowed, false},
@@ -387,7 +423,7 @@ func TestScanErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rec := do(newRealHandler(t, Options{MaxBodyBytes: tt.maxBody, MaxLineBytes: 128}), tt.method, tt.target, tt.contentType, tt.body)
+			rec := do(newRealHandler(t, Options{MaxBodyBytes: tt.maxBody}), tt.method, tt.target, tt.contentType, tt.body)
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
 			}
@@ -428,7 +464,7 @@ func TestScanCanceled(t *testing.T) {
 // TestScanConcurrent exercises the shared detector from many goroutines; run
 // with -race.
 func TestScanConcurrent(t *testing.T) {
-	h := newRealHandler(t, Options{MaxConcurrentScans: 32})
+	h := newRealHandler(t, Options{})
 	withSecret := scanBody(t, scanRequest{Content: "token = \"" + testSecret + "\"", Path: "a.env"})
 	clean := scanBody(t, scanRequest{Content: "nothing to see here"})
 

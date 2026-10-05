@@ -14,11 +14,12 @@ import (
 // defaultMaxDecodeDepth mirrors the betterleaks CLI default for --max-decode-depth.
 const defaultMaxDecodeDepth = 5
 
-// Scanner scans content for secrets and exposes the loaded rules.
+// Scanner scans text for secrets and exposes the loaded rules.
 type Scanner interface {
-	// Scan returns the findings in content. path is an optional virtual file
-	// name used by path-based rules and allowlists.
-	Scan(ctx context.Context, content, path string) ([]report.Finding, error)
+	// ScanFragment returns the findings in one fragment of a content. path is
+	// an optional virtual file name used by path-based rules and allowlists.
+	// first reports whether this is the first fragment of the content.
+	ScanFragment(ctx context.Context, text, path string, first bool) ([]report.Finding, error)
 	Rules() []Rule
 }
 
@@ -38,6 +39,9 @@ func NewBetterleaksScanner(ctx context.Context) (*BetterleaksScanner, error) {
 
 	d := detect.NewDetectorContext(ctx, cfg, detect.ValidationOptions{})
 	d.MaxDecodeDepth = defaultMaxDecodeDepth
+	// The scanned text is untrusted: a "betterleaks:allow" comment in it must
+	// not be able to switch detection off.
+	d.IgnoreGitleaksAllow = true
 
 	rules := make([]Rule, 0, len(cfg.Rules))
 	for _, r := range cfg.Rules {
@@ -52,11 +56,16 @@ func NewBetterleaksScanner(ctx context.Context) (*BetterleaksScanner, error) {
 	return &BetterleaksScanner{detector: d, rules: rules}, nil
 }
 
-// Scan is safe for concurrent use.
-func (s *BetterleaksScanner) Scan(ctx context.Context, content, path string) ([]report.Finding, error) {
-	fragment := sources.Fragment{Raw: content}
+// ScanFragment is safe for concurrent use.
+func (s *BetterleaksScanner) ScanFragment(ctx context.Context, text, path string, first bool) ([]report.Finding, error) {
+	fragment := sources.Fragment{Raw: text}
 	if path != "" {
 		fragment.SetAttr(sources.AttrPath, path)
+		if !first {
+			// Rules that match on the path alone must report once per
+			// content, not once per fragment.
+			fragment.SetAttr(sources.AttrFSFirstFragment, "false")
+		}
 	}
 
 	// DetectContext is used instead of Run: Run mutates detector-level state
